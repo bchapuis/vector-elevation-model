@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>MVT Test</title>
+    <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+    <style>
+        body { margin: 0; padding: 0; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+        #debug { position: absolute; top: 10px; right: 10px; background: white; padding: 10px; z-index: 1000; max-width: 400px; font-family: monospace; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="debug">
+        <h3>Debug Info</h3>
+        <div id="info">Loading...</div>
+        <button onclick="fetchAndInspectTile()">Inspect Current Tile</button>
+        <pre id="tile-info"></pre>
+    </div>
+    <script>
+        const map = new maplibregl.Map({
+            container: 'map',
+            style: {
+                version: 8,
+                sources: {
+                    'hillshade': {
+                        type: 'raster-dem',
+                        url: 'https://tiles.mapterhorn.com/tilejson.json',
+                        tileSize: 512
+                    },
+                    'contours': {
+                        type: 'vector',
+                        tiles: [window.location.origin + '/tiles/contour/{z}/{x}/{y}.mvt'],
+                        minzoom: 1,
+                        maxzoom: 15
+                    }
+                },
+                layers: [
+                    {
+                        id: 'hillshade-layer',
+                        type: 'hillshade',
+                        source: 'hillshade'
+                    },
+                    {
+                        id: 'contour-lines',
+                        type: 'line',
+                        source: 'contours',
+                        'source-layer': 'contour',
+                        paint: {
+                            'line-color': '#ff0000',
+                            'line-width': 3,
+                            'line-opacity': 1
+                        }
+                    }
+                ]
+            },
+            center: [7.45, 46.95],
+            zoom: 12
+        });
+
+        map.on('load', () => {
+            document.getElementById('info').innerHTML = 'Map loaded. Move around to load tiles.';
+        });
+
+        map.on('error', (e) => {
+            console.error('Map error:', e);
+            document.getElementById('info').innerHTML += '<br>Error: ' + JSON.stringify(e.error);
+        });
+
+        map.on('sourcedata', (e) => {
+            if (e.sourceId === 'contours' && e.isSourceLoaded) {
+                document.getElementById('info').innerHTML = 'Contour source loaded';
+            }
+        });
+
+        map.on('moveend', () => {
+            const center = map.getCenter();
+            const zoom = Math.floor(map.getZoom());
+            const x = Math.floor((center.lng + 180) / 360 * Math.pow(2, zoom));
+            const y = Math.floor((1 - Math.log(Math.tan(center.lat * Math.PI / 180) + 1 / Math.cos(center.lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, zoom));
+            document.getElementById('info').innerHTML = `Center tile: ${zoom}/${x}/${y}`;
+        });
+
+        async function fetchAndInspectTile() {
+            const center = map.getCenter();
+            const zoom = Math.floor(map.getZoom());
+            const x = Math.floor((center.lng + 180) / 360 * Math.pow(2, zoom));
+            const y = Math.floor((1 - Math.log(Math.tan(center.lat * Math.PI / 180) + 1 / Math.cos(center.lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, zoom));
+
+            const url = `/api/debug/contour/${zoom}/${x}/${y}`;
+            document.getElementById('tile-info').textContent = `Fetching ${url}...`;
+
+            try {
+                const response = await fetch(url);
+                const data = await response.json();
+                document.getElementById('tile-info').textContent = JSON.stringify(data, null, 2);
+            } catch (err) {
+                document.getElementById('tile-info').textContent = 'Error: ' + err.message;
+            }
+        }
+
+        // Also try to query features directly
+        map.on('click', (e) => {
+            const features = map.queryRenderedFeatures(e.point, { layers: ['contour-lines'] });
+            console.log('Clicked features:', features);
+            if (features.length > 0) {
+                document.getElementById('tile-info').textContent = 'Found features:\n' + JSON.stringify(features.map(f => f.properties), null, 2);
+            } else {
+                document.getElementById('tile-info').textContent = 'No contour features at click point';
+            }
+        });
+    </script>
+</body>
+</html>
