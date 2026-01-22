@@ -9,8 +9,6 @@
 
 import type { Feature, LineString, Polygon } from 'geojson';
 import { lineString, polygon } from '@turf/helpers';
-import booleanPointInPolygon from '@turf/boolean-point-in-polygon';
-import area from '@turf/area';
 
 import { type Grid, createGrid, gridGetAt } from './grid';
 
@@ -278,64 +276,190 @@ function interpolate(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Segment Merging
+// Segment Merging (Optimized with coordinate-indexed lookup)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Quantizes a coordinate to a string key for hash-based lookups.
+ * Uses fixed precision to handle floating-point tolerance matching.
+ */
+function coordKey(coord: Coordinate): string {
+  // Quantize to 6 decimal places (~0.1mm precision at equator)
+  const x = Math.round(coord[0] * 1e6);
+  const y = Math.round(coord[1] * 1e6);
+  return `${x},${y}`;
+}
+
+/**
+ * A chain is a mutable polyline that can grow at either end.
+ * Using a doubly-ended structure avoids expensive array reversals.
+ */
+interface Chain {
+  coords: Coordinate[];
+  startKey: string;
+  endKey: string;
+  merged: boolean;
+}
+
+/**
  * Merges disconnected segments into continuous polylines.
+ *
+ * Optimized algorithm: O(n) average case using coordinate-indexed maps
+ * instead of O(n²) brute-force matching. Each segment endpoint is indexed
+ * for O(1) lookup when finding merge candidates.
  */
 function mergeSegments(segments: Coordinate[][]): Coordinate[][] {
   if (segments.length === 0) return [];
 
-  const merged: Coordinate[][] = [];
-  const remaining = [...segments];
+  // Index maps: coordinate key -> chains that have this coordinate as endpoint
+  const byStart = new Map<string, Chain[]>();
+  const byEnd = new Map<string, Chain[]>();
 
-  while (remaining.length > 0) {
-    let current = remaining.pop()!;
-    let changed = true;
+  // Initialize each segment as its own chain
+  const chains: Chain[] = segments.map((seg) => ({
+    coords: [...seg],
+    startKey: coordKey(seg[0]),
+    endKey: coordKey(seg[seg.length - 1]),
+    merged: false,
+  }));
 
-    while (changed) {
-      changed = false;
-
-      for (let i = remaining.length - 1; i >= 0; i--) {
-        const seg = remaining[i];
-        const result = tryMerge(current, seg);
-        if (result) {
-          current = result;
-          remaining.splice(i, 1);
-          changed = true;
-        }
-      }
-    }
-
-    merged.push(current);
+  // Build initial index
+  for (const chain of chains) {
+    addToIndex(byStart, chain.startKey, chain);
+    addToIndex(byEnd, chain.endKey, chain);
   }
 
-  return merged;
+  // Process each chain, attempting to extend it
+  for (const chain of chains) {
+    if (chain.merged) continue;
+    extendChain(chain, byStart, byEnd);
+  }
+
+  // Collect non-merged chains
+  return chains.filter((c) => !c.merged).map((c) => c.coords);
+}
+
+function addToIndex(index: Map<string, Chain[]>, key: string, chain: Chain): void {
+  const list = index.get(key);
+  if (list) {
+    list.push(chain);
+  } else {
+    index.set(key, [chain]);
+  }
+}
+
+function removeFromIndex(index: Map<string, Chain[]>, key: string, chain: Chain): void {
+  const list = index.get(key);
+  if (list) {
+    const idx = list.indexOf(chain);
+    if (idx >= 0) list.splice(idx, 1);
+  }
 }
 
 /**
- * Attempts to merge two segments, returning the merged result or null.
+ * Extends a chain by repeatedly finding and merging connected segments.
  */
-function tryMerge(a: Coordinate[], b: Coordinate[]): Coordinate[] | null {
-  const aStart = a[0];
-  const aEnd = a[a.length - 1];
-  const bStart = b[0];
-  const bEnd = b[b.length - 1];
+function extendChain(
+  chain: Chain,
+  byStart: Map<string, Chain[]>,
+  byEnd: Map<string, Chain[]>
+): void {
+  let changed = true;
 
-  if (coordsEqual(aEnd, bStart)) {
-    return [...a, ...b.slice(1)];
+  while (changed) {
+    changed = false;
+
+    // Try to extend at the end of this chain
+    const endCandidates = byStart.get(chain.endKey) ?? [];
+    for (const other of endCandidates) {
+      if (other === chain || other.merged) continue;
+
+      // other.start matches chain.end -> append other to chain
+      removeFromIndex(byStart, other.startKey, other);
+      removeFromIndex(byEnd, other.endKey, other);
+      removeFromIndex(byEnd, chain.endKey, chain);
+
+      // Append (skip duplicate junction point)
+      chain.coords.push(...other.coords.slice(1));
+      chain.endKey = other.endKey;
+      other.merged = true;
+
+      addToIndex(byEnd, chain.endKey, chain);
+      changed = true;
+      break;
+    }
+
+    if (changed) continue;
+
+    // Try other.end matches chain.end -> append reversed other
+    const endEndCandidates = byEnd.get(chain.endKey) ?? [];
+    for (const other of endEndCandidates) {
+      if (other === chain || other.merged) continue;
+
+      removeFromIndex(byStart, other.startKey, other);
+      removeFromIndex(byEnd, other.endKey, other);
+      removeFromIndex(byEnd, chain.endKey, chain);
+
+      // Append reversed (skip duplicate junction point)
+      for (let i = other.coords.length - 2; i >= 0; i--) {
+        chain.coords.push(other.coords[i]);
+      }
+      chain.endKey = other.startKey;
+      other.merged = true;
+
+      addToIndex(byEnd, chain.endKey, chain);
+      changed = true;
+      break;
+    }
+
+    if (changed) continue;
+
+    // Try to extend at the start of this chain
+    const startCandidates = byEnd.get(chain.startKey) ?? [];
+    for (const other of startCandidates) {
+      if (other === chain || other.merged) continue;
+
+      // other.end matches chain.start -> prepend other to chain
+      removeFromIndex(byStart, other.startKey, other);
+      removeFromIndex(byEnd, other.endKey, other);
+      removeFromIndex(byStart, chain.startKey, chain);
+
+      // Prepend (skip duplicate junction point)
+      const newCoords = [...other.coords.slice(0, -1), ...chain.coords];
+      chain.coords = newCoords;
+      chain.startKey = other.startKey;
+      other.merged = true;
+
+      addToIndex(byStart, chain.startKey, chain);
+      changed = true;
+      break;
+    }
+
+    if (changed) continue;
+
+    // Try other.start matches chain.start -> prepend reversed other
+    const startStartCandidates = byStart.get(chain.startKey) ?? [];
+    for (const other of startStartCandidates) {
+      if (other === chain || other.merged) continue;
+
+      removeFromIndex(byStart, other.startKey, other);
+      removeFromIndex(byEnd, other.endKey, other);
+      removeFromIndex(byStart, chain.startKey, chain);
+
+      // Prepend reversed (skip duplicate junction point)
+      const reversed: Coordinate[] = [];
+      for (let i = other.coords.length - 1; i >= 1; i--) {
+        reversed.push(other.coords[i]);
+      }
+      chain.coords = [...reversed, ...chain.coords];
+      chain.startKey = other.endKey;
+      other.merged = true;
+
+      addToIndex(byStart, chain.startKey, chain);
+      changed = true;
+      break;
+    }
   }
-  if (coordsEqual(aEnd, bEnd)) {
-    return [...a, ...b.slice(0, -1).reverse()];
-  }
-  if (coordsEqual(aStart, bEnd)) {
-    return [...b.slice(0, -1), ...a];
-  }
-  if (coordsEqual(aStart, bStart)) {
-    return [...b.slice(1).reverse(), ...a];
-  }
-  return null;
 }
 
 function coordsEqual(a: Coordinate, b: Coordinate): boolean {
@@ -343,15 +467,54 @@ function coordsEqual(a: Coordinate, b: Coordinate): boolean {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Polygon Construction with Hole Detection
+// Polygon Construction with Hole Detection (Optimized)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Computes signed area of a ring using the shoelace formula.
+ * Positive = counter-clockwise, negative = clockwise.
+ */
+function ringArea(ring: Coordinate[]): number {
+  let area = 0;
+  const n = ring.length;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    area += (ring[j][0] - ring[i][0]) * (ring[j][1] + ring[i][1]);
+  }
+  return area / 2;
+}
+
+/**
+ * Ray-casting point-in-ring test.
+ * Counts intersections of a horizontal ray from point to +infinity.
+ * Odd count = inside, even = outside.
+ */
+function pointInRing(point: Coordinate, ring: Coordinate[]): boolean {
+  const [px, py] = point;
+  let inside = false;
+
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+
+    // Check if edge crosses the horizontal ray from point
+    if ((yi > py) !== (yj > py)) {
+      // Compute x-coordinate of intersection
+      const xIntersect = ((xj - xi) * (py - yi)) / (yj - yi) + xi;
+      if (px < xIntersect) {
+        inside = !inside;
+      }
+    }
+  }
+
+  return inside;
+}
 
 /**
  * Converts closed contour lines to polygons with proper hole detection.
  */
 function buildPolygonsWithHoles(lines: Coordinate[][], level: number): Feature<Polygon>[] {
   // Build and sort polygons by area (largest first)
-  const polys: { ring: Coordinate[]; area: number; feature: Feature<Polygon> }[] = [];
+  const polys: { ring: Coordinate[]; area: number }[] = [];
 
   for (const line of lines) {
     const ring = closeRing(line);
@@ -362,11 +525,9 @@ function buildPolygonsWithHoles(lines: Coordinate[][], level: number): Feature<P
     }
 
     // Force exact coordinate equality for first/last position
-    // (closeRing uses epsilon comparison, but Turf requires exact match)
     ring[ring.length - 1] = ring[0];
 
-    const feat = polygon([ring], { level });
-    polys.push({ ring, area: Math.abs(area(feat)), feature: feat });
+    polys.push({ ring, area: Math.abs(ringArea(ring)) });
   }
 
   polys.sort((a, b) => b.area - a.area);
@@ -385,7 +546,7 @@ function buildPolygonsWithHoles(lines: Coordinate[][], level: number): Feature<P
       if (used.has(j)) continue;
 
       const candidate = polys[j];
-      if (isInsidePolygon(candidate.ring[0], shell.feature, holes)) {
+      if (isInsidePolygon(candidate.ring[0], shell.ring, holes)) {
         holes.push(candidate.ring);
         used.add(j);
       }
@@ -406,17 +567,21 @@ function closeRing(coords: Coordinate[]): Coordinate[] {
   return ring;
 }
 
+/**
+ * Tests if a point is inside a shell polygon but not inside any existing holes.
+ * Uses inline ray-casting for O(n) per-ring performance.
+ */
 function isInsidePolygon(
   point: Coordinate,
-  shell: Feature<Polygon>,
+  shell: Coordinate[],
   existingHoles: Coordinate[][]
 ): boolean {
-  if (!booleanPointInPolygon(point, shell)) {
+  if (!pointInRing(point, shell)) {
     return false;
   }
   // Check it's not inside an existing hole
   for (const hole of existingHoles) {
-    if (booleanPointInPolygon(point, polygon([hole]))) {
+    if (pointInRing(point, hole)) {
       return false;
     }
   }

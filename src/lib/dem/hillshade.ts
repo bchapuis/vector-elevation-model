@@ -62,19 +62,30 @@ export function hillshade(
   const azimuthRad = ((360 - azimuth + 90) * Math.PI) / 180;
   const zenithRad = ((90 - altitude) * Math.PI) / 180;
 
+  // Pre-compute sun direction vector for dot product optimization
   const cosZenith = Math.cos(zenithRad);
   const sinZenith = Math.sin(zenithRad);
+  const sunX = sinZenith * Math.cos(azimuthRad);
+  const sunY = sinZenith * Math.sin(azimuthRad);
+  const sunZ = cosZenith;
+
+  // Pre-compute gradient scale factor (1 / 8*cellSize)
+  const gradientScale = 1 / (8 * cellSize);
+
+  // Flat terrain illumination (slope = 0)
+  const flatIllumination = 255 * cosZenith;
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      const value = computePixelHillshade(
+      const value = computePixelHillshadeFast(
         grid,
         x,
         y,
-        cellSize,
-        azimuthRad,
-        cosZenith,
-        sinZenith
+        gradientScale,
+        sunX,
+        sunY,
+        sunZ,
+        flatIllumination
       );
       result[y * width + x] = value;
     }
@@ -120,23 +131,32 @@ export function getResolution(zoom: number, tileSize: number = 256): number {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Hillshade Computation
+// Hillshade Computation (Optimized)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Threshold for flat terrain fast-path (gradient magnitude squared) */
+const FLAT_THRESHOLD_SQ = 1e-10;
+
 /**
- * Computes hillshade for a single pixel using Sobel gradient and Lambertian reflectance.
+ * Computes hillshade using direct dot product formulation.
  *
- * Sobel filter weights center neighbors 2x over corners for better noise resistance.
- * Lambertian model assumes diffuse surfaces - appropriate for terrain visualization.
+ * Instead of computing slope/aspect angles and using trig functions,
+ * we compute the dot product of the sun vector and surface normal directly:
+ *
+ *   normal = (-dzdx, -dzdy, 1) / |normal|
+ *   illumination = sun · normal
+ *
+ * This avoids atan, atan2, and multiple sin/cos calls per pixel.
  */
-function computePixelHillshade(
+function computePixelHillshadeFast(
   grid: Grid,
   x: number,
   y: number,
-  cellSize: number,
-  azimuthRad: number,
-  cosZenith: number,
-  sinZenith: number
+  gradientScale: number,
+  sunX: number,
+  sunY: number,
+  sunZ: number,
+  flatIllumination: number
 ): number {
   // Sample 3x3 neighborhood (with clamping at boundaries)
   const a = gridGet(grid, x - 1, y - 1);
@@ -148,21 +168,27 @@ function computePixelHillshade(
   const h = gridGet(grid, x, y + 1);
   const i = gridGet(grid, x + 1, y + 1);
 
-  // Sobel gradients (weighted finite differences)
-  const dzdx = (c + 2 * f + i - (a + 2 * d + g)) / (8 * cellSize);
-  const dzdy = (g + 2 * h + i - (a + 2 * b + c)) / (8 * cellSize);
+  // Sobel gradients (pre-scaled)
+  const dzdx = (c + 2 * f + i - (a + 2 * d + g)) * gradientScale;
+  const dzdy = (g + 2 * h + i - (a + 2 * b + c)) * gradientScale;
 
-  // Slope and aspect
-  const slopeRad = Math.atan(Math.sqrt(dzdx * dzdx + dzdy * dzdy));
-  let aspectRad = Math.atan2(dzdy, -dzdx);
-  if (aspectRad < 0) aspectRad += 2 * Math.PI;
+  // Fast path for flat terrain (very common case)
+  const gradMagSq = dzdx * dzdx + dzdy * dzdy;
+  if (gradMagSq < FLAT_THRESHOLD_SQ) {
+    return flatIllumination;
+  }
 
-  // Lambertian reflectance
-  const illumination =
-    cosZenith * Math.cos(slopeRad) +
-    sinZenith * Math.sin(slopeRad) * Math.cos(azimuthRad - aspectRad);
+  // Surface normal (unnormalized): (-dzdx, -dzdy, 1)
+  // Magnitude: sqrt(dzdx² + dzdy² + 1)
+  const normalMag = Math.sqrt(gradMagSq + 1);
 
-  return Math.max(0, Math.min(255, 255 * illumination));
+  // Dot product of sun direction and normalized surface normal
+  // sun · (normal / |normal|) = (sunX*(-dzdx) + sunY*(-dzdy) + sunZ*1) / |normal|
+  const dotProduct = (-sunX * dzdx - sunY * dzdy + sunZ) / normalMag;
+
+  // Clamp to [0, 255]
+  const illumination = 255 * dotProduct;
+  return illumination < 0 ? 0 : illumination > 255 ? 255 : illumination;
 }
 
 function validateSunPosition(altitude: number, azimuth: number): void {
