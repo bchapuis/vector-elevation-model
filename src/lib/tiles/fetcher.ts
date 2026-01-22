@@ -99,10 +99,11 @@ export class TileFetcher {
    * context at tile edges. Without buffer, contours would be discontinuous at
    * tile boundaries.
    *
-   * Why 9-tile stitching: Source tiles are typically larger (512px) than output
-   * tiles (256px). The buffer region may extend into neighboring tiles, so we
-   * fetch a 3x3 grid of source tiles, stitch them, then sample the center
-   * region with buffer.
+   * Why 4-tile stitching: We use a 2×2 corner-aligned approach, fetching only
+   * the requested tile plus its right, bottom, and bottom-right neighbors.
+   * The sampling window is positioned at the corner where these 4 tiles meet,
+   * allowing us to get buffer pixels from all directions with only 4 tiles
+   * instead of 9.
    */
   async fetchTile(coord: TileCoord, bufferPx: number = 0): Promise<BufferedGrid> {
     const { z, x, y } = coord;
@@ -117,14 +118,14 @@ export class TileFetcher {
       return this.sampleElevationGrid(center, outputSize, bufferPx);
     }
 
-    // Buffer case: fetch 3x3 tile neighborhood and stitch
-    const tiles = await this.fetch3x3Neighborhood(z, x, y);
+    // Buffer case: fetch 2x2 tile neighborhood (corner-aligned approach)
+    const tiles = await this.fetch2x2Neighborhood(z, x, y);
     if (!tiles.center) {
       throw new Error(`Failed to fetch center tile ${z}/${x}/${y}`);
     }
 
-    const stitched = this.stitchTiles(tiles);
-    return this.sampleFromStitched(stitched, outputSize, bufferPx);
+    const stitched = this.stitch2x2Tiles(tiles);
+    return this.sampleFrom2x2Stitched(stitched, outputSize, bufferPx);
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -202,6 +203,31 @@ export class TileFetcher {
     return { center, left, right, top, bottom, topLeft, topRight, bottomLeft, bottomRight };
   }
 
+  /**
+   * Fetches 4 tiles in a 2×2 neighborhood (corner-aligned approach).
+   *
+   * Layout:  [center]  [right]
+   *          [bottom]  [bottomRight]
+   *
+   * The sampling window is centered at the corner where these 4 tiles meet,
+   * providing buffer pixels from all directions with only 4 tile fetches.
+   */
+  private async fetch2x2Neighborhood(z: number, x: number, y: number): Promise<{
+    center: TilePixels | null;
+    right: TilePixels | null;
+    bottom: TilePixels | null;
+    bottomRight: TilePixels | null;
+  }> {
+    // All 4 tiles fetched in parallel (single Promise.all batch)
+    const [center, right, bottom, bottomRight] = await Promise.all([
+      this.fetchTilePixels(z, x, y),
+      this.fetchTilePixels(z, x + 1, y),
+      this.fetchTilePixels(z, x, y + 1),
+      this.fetchTilePixels(z, x + 1, y + 1),
+    ]);
+    return { center, right, bottom, bottomRight };
+  }
+
   // ───────────────────────────────────────────────────────────────────────────
   // Tile Stitching
   // ───────────────────────────────────────────────────────────────────────────
@@ -238,6 +264,31 @@ export class TileFetcher {
     this.copyTileToCanvas(tiles.bottomLeft, stitched, stitchedSize, 0, 2 * s);
     this.copyTileToCanvas(tiles.bottom, stitched, stitchedSize, s, 2 * s);
     this.copyTileToCanvas(tiles.bottomRight, stitched, stitchedSize, 2 * s, 2 * s);
+
+    return { data: stitched, size: stitchedSize };
+  }
+
+  /**
+   * Stitches 4 tiles into a 2×2 canvas of RGBA pixels.
+   *
+   * Layout:  [center]  [right]
+   *          [bottom]  [bottomRight]
+   */
+  private stitch2x2Tiles(tiles: {
+    center: TilePixels | null;
+    right: TilePixels | null;
+    bottom: TilePixels | null;
+    bottomRight: TilePixels | null;
+  }): { data: Uint8Array; size: number } {
+    const s = this.sourceTileSize;
+    const stitchedSize = s * 2; // 1024 (vs 1536 for 3×3)
+    const stitched = new Uint8Array(stitchedSize * stitchedSize * 4);
+
+    // Copy each tile to its position in the 2×2 grid
+    this.copyTileToCanvas(tiles.center, stitched, stitchedSize, 0, 0);
+    this.copyTileToCanvas(tiles.right, stitched, stitchedSize, s, 0);
+    this.copyTileToCanvas(tiles.bottom, stitched, stitchedSize, 0, s);
+    this.copyTileToCanvas(tiles.bottomRight, stitched, stitchedSize, s, s);
 
     return { data: stitched, size: stitchedSize };
   }
@@ -297,6 +348,62 @@ export class TileFetcher {
         let srcY = s + Math.floor((tileY + 0.5) * scale);
 
         // Clamp to stitched canvas bounds
+        srcX = Math.max(0, Math.min(stitchedSize - 1, srcX));
+        srcY = Math.max(0, Math.min(stitchedSize - 1, srcY));
+
+        const srcIdx = (srcY * stitchedSize + srcX) * 4;
+        grid[oy * outputSize + ox] = terrariumToElevation(
+          data[srcIdx],
+          data[srcIdx + 1],
+          data[srcIdx + 2]
+        );
+      }
+    }
+
+    return { grid, width: outputSize, height: outputSize, bufferPx };
+  }
+
+  /**
+   * Samples elevation values from a stitched 2×2 canvas (centered on tile C).
+   *
+   * Layout:  [C]  [R]      C = center tile (requested)
+   *          [B]  [BR]     R = right, B = bottom, BR = bottom-right
+   *
+   * Geographic alignment: The center tile C is at canvas position (0,0).
+   * Output coordinates map directly to source coordinates with scale factor.
+   * This provides buffer on RIGHT and BOTTOM edges from tiles R and B.
+   * LEFT and TOP buffer coordinates are clamped to tile C's edge.
+   *
+   * Coordinate mapping (with scale=2):
+   *   - Output (0, 0) → Source (1, 1) in C
+   *   - Output (128, 128) → Source (257, 257) in C (center of C)
+   *   - Output (255, 255) → Source (511, 511) in C (edge of C)
+   *   - Output (263, 263) → Source (527, 527) in BR (buffer region)
+   *   - Output (-8, -8) → Source (0, 0) clamped (no left/top neighbor)
+   */
+  private sampleFrom2x2Stitched(
+    stitched: { data: Uint8Array; size: number },
+    outputSize: number,
+    bufferPx: number
+  ): BufferedGrid {
+    const { data, size: stitchedSize } = stitched;
+    const scale = this.sourceTileSize / TILE_SIZE;
+    const grid = new Float64Array(outputSize * outputSize);
+
+    for (let oy = 0; oy < outputSize; oy++) {
+      for (let ox = 0; ox < outputSize; ox++) {
+        // Map output coords to tile-relative coords (with buffer offset)
+        const tileX = ox - bufferPx;
+        const tileY = oy - bufferPx;
+
+        // Sample centered on tile C (at canvas origin)
+        // No offset needed - tile C starts at (0, 0)
+        let srcX = Math.floor((tileX + 0.5) * scale);
+        let srcY = Math.floor((tileY + 0.5) * scale);
+
+        // Clamp to stitched canvas bounds
+        // Left/top buffer will clamp to 0 (edge of C)
+        // Right/bottom buffer extends into R/B/BR tiles
         srcX = Math.max(0, Math.min(stitchedSize - 1, srcX));
         srcY = Math.max(0, Math.min(stitchedSize - 1, srcY));
 

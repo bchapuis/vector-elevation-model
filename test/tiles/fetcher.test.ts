@@ -107,7 +107,7 @@ describe('TileFetcher', () => {
   });
 
   describe('fetchTile with buffer', () => {
-    it('should fetch 3x3 tile neighborhood for buffered grids', async () => {
+    it('should fetch 2x2 tile neighborhood for buffered grids', async () => {
       const mockImage = createMockPhotonImage(512, 512, 500);
       vi.mocked(PhotonImage.new_from_byteslice).mockReturnValue(mockImage as any);
 
@@ -125,8 +125,8 @@ describe('TileFetcher', () => {
       expect(result.bufferPx).toBe(4);
       expect(result.grid.length).toBe(264 * 264);
 
-      // Should fetch 9 tiles (3x3 neighborhood)
-      expect(global.fetch).toHaveBeenCalledTimes(9);
+      // Should fetch 4 tiles (2x2 corner-aligned neighborhood)
+      expect(global.fetch).toHaveBeenCalledTimes(4);
     });
 
     it('should throw if center tile fails', async () => {
