@@ -351,11 +351,23 @@ function coordsEqual(a: Coordinate, b: Coordinate): boolean {
  */
 function buildPolygonsWithHoles(lines: Coordinate[][], level: number): Feature<Polygon>[] {
   // Build and sort polygons by area (largest first)
-  const polys = lines.map((line) => {
+  const polys: { ring: Coordinate[]; area: number; feature: Feature<Polygon> }[] = [];
+
+  for (const line of lines) {
     const ring = closeRing(line);
+
+    // Skip degenerate rings (need at least 4 positions for a valid LinearRing)
+    if (ring.length < 4) {
+      continue;
+    }
+
+    // Force exact coordinate equality for first/last position
+    // (closeRing uses epsilon comparison, but Turf requires exact match)
+    ring[ring.length - 1] = ring[0];
+
     const feat = polygon([ring], { level });
-    return { ring, area: Math.abs(area(feat)), feature: feat };
-  });
+    polys.push({ ring, area: Math.abs(area(feat)), feature: feat });
+  }
 
   polys.sort((a, b) => b.area - a.area);
 
