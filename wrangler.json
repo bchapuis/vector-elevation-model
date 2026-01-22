@@ -20,7 +20,8 @@
 	},
 	"vars": {
 		"CACHE_ENABLED": "true",
-		"COMPRESSION_ENABLED": "false"
+		"COMPRESSION_ENABLED": "false",
+		"CACHE_VERSION": "v2"
 	}
 	/**
 	 * Smart Placement
