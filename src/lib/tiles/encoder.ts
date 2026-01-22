@@ -93,6 +93,91 @@ export function encodeFeatures(
 }
 
 /**
+ * A layer definition for multi-layer encoding
+ */
+export interface LayerDefinition {
+  name: string;
+  features: Feature<LineString | Polygon>[];
+}
+
+/**
+ * Options for multi-layer MVT encoding
+ */
+export interface MultiLayerEncoderOptions {
+  /** MVT extent (default: 4096) */
+  extent?: number;
+  /** Whether to GZIP compress the output (default: true) */
+  compress?: boolean;
+  /** MVT version (default: 2) */
+  version?: number;
+}
+
+/**
+ * Encodes multiple layers of GeoJSON features to a single MVT.
+ *
+ * Features should be pre-transformed to MVT coordinates [0, extent].
+ * Each layer becomes a separate layer in the resulting vector tile.
+ */
+export function encodeMultiLayerFeatures(
+  layers: LayerDefinition[],
+  options: MultiLayerEncoderOptions = {}
+): Uint8Array {
+  const {
+    extent = MVT_EXTENT,
+    compress = true,
+    version = 2,
+  } = options;
+
+  // Build tile structure for each layer
+  const tilesByLayer: Record<string, unknown> = {};
+
+  for (const layer of layers) {
+    const vtFeatures = layer.features.map((feature, index) => {
+      const geom = feature.geometry;
+      const props = feature.properties ?? {};
+
+      if (geom.type === 'LineString') {
+        return {
+          id: feature.id ?? index,
+          type: 2 as const,
+          geometry: [geom.coordinates.map((c) => [Math.round(c[0]), Math.round(c[1])])],
+          tags: props,
+        };
+      }
+      return {
+        id: feature.id ?? index,
+        type: 3 as const,
+        geometry: (geom as Polygon).coordinates.map((ring) =>
+          ring.map((c) => [Math.round(c[0]), Math.round(c[1])])
+        ),
+        tags: props,
+      };
+    });
+
+    tilesByLayer[layer.name] = {
+      features: vtFeatures,
+      numPoints: 0,
+      numSimplified: 0,
+      numFeatures: vtFeatures.length,
+      source: null,
+      x: 0,
+      y: 0,
+      z: 0,
+      transformed: true,
+      minX: 0,
+      minY: 0,
+      maxX: extent,
+      maxY: extent,
+    };
+  }
+
+  // Encode all layers to Protocol Buffer format
+  const buffer = fromGeojsonVt(tilesByLayer, { extent, version });
+
+  return compress ? pako.gzip(buffer) : buffer;
+}
+
+/**
  * Creates HTTP response headers for an MVT tile
  *
  * @param compressed Whether the tile is gzip compressed

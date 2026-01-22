@@ -18,15 +18,10 @@ function App() {
       style: {
         version: 8,
         sources: {
-          hillshade: {
+          // Combined terrain source - single tile contains both layers
+          terrain: {
             type: "vector",
-            tiles: [window.location.origin + "/tiles/hillshade/{z}/{x}/{y}.mvt"],
-            minzoom: 1,
-            maxzoom: 15,
-          },
-          contour: {
-            type: "vector",
-            tiles: [window.location.origin + "/tiles/contour/{z}/{x}/{y}.mvt"],
+            tiles: [window.location.origin + "/tiles/terrain/{z}/{x}/{y}.mvt"],
             minzoom: 1,
             maxzoom: 15,
           },
@@ -40,7 +35,7 @@ function App() {
           {
             id: "hillshade-shadow",
             type: "fill",
-            source: "hillshade",
+            source: "terrain",
             "source-layer": "hillshade",
             filter: ["<", ["get", "shade"], 0.5],
             layout: { visibility: "visible" },
@@ -59,7 +54,7 @@ function App() {
           {
             id: "hillshade-highlight",
             type: "fill",
-            source: "hillshade",
+            source: "terrain",
             "source-layer": "hillshade",
             filter: [">=", ["get", "shade"], 0.5],
             layout: { visibility: "visible" },
@@ -78,7 +73,7 @@ function App() {
           {
             id: "contour-lines",
             type: "line",
-            source: "contour",
+            source: "terrain",
             "source-layer": "contour",
             filter: ["==", ["get", "index"], false],
             layout: { visibility: "visible" },
@@ -91,7 +86,7 @@ function App() {
           {
             id: "contour-index",
             type: "line",
-            source: "contour",
+            source: "terrain",
             "source-layer": "contour",
             filter: ["==", ["get", "index"], true],
             layout: { visibility: "visible" },

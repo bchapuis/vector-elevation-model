@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { contourHandler } from "./routes/contour";
-import { hillshadeHandler } from "./routes/hillshade";
+import { terrainHandler } from "./routes/terrain";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -10,8 +9,7 @@ app.use("*", cors());
 
 app.get("/api/", (c) => c.json({ name: "Cloudflare" }));
 
-// Vector tile endpoints
-app.get("/tiles/contour/:z/:x/:y", contourHandler);
-app.get("/tiles/hillshade/:z/:x/:y", hillshadeHandler);
+// Vector tile endpoint - single MVT with both contour and hillshade layers
+app.get("/tiles/terrain/:z/:x/:y", terrainHandler);
 
 export default app;
